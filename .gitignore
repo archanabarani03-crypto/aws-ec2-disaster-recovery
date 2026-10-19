@@ -1,0 +1,14 @@
+cat > .gitignore <<'EOF'
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+terraform.rc
+.terraformrc
+*.pem
+.env
+.env.*
+.aws/
+.DS_Store
+EOF

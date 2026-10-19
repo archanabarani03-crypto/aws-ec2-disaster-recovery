@@ -1,0 +1,103 @@
+#!/bin/bash
+set -euxo pipefail
+
+# Log all bootstrap output for troubleshooting.
+exec > >(tee -a /var/log/dr-bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "Starting EC2 Disaster Recovery bootstrap..."
+
+# Install required packages. AWS CLI is installed separately below.
+apt-get update
+apt-get install -y nginx curl cron unzip ca-certificates
+
+# Install AWS CLI v2 from the official AWS distribution.
+case "$(dpkg --print-architecture)" in
+  amd64) AWSCLI_ARCH="x86_64" ;;
+  arm64) AWSCLI_ARCH="aarch64" ;;
+  *)
+    echo "Unsupported architecture: $(dpkg --print-architecture)"
+    exit 1
+    ;;
+esac
+
+curl -fsSL \
+  "https://awscli.amazonaws.com/awscli-exe-linux-$${AWSCLI_ARCH}.zip" \
+  -o /tmp/awscliv2.zip
+
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
+
+aws --version
+
+# Start required services.
+systemctl enable --now nginx
+systemctl enable --now cron
+
+# Create the website and application data directory.
+mkdir -p /var/www/html/data
+
+cat > /var/www/html/index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>EC2 Disaster Recovery Lab</title>
+</head>
+<body>
+  <h1>Production Web Application</h1>
+  <p>EC2 disaster recovery lab is running.</p>
+  <p><a href="/health">Health check</a></p>
+</body>
+</html>
+HTML
+
+cat > /var/www/html/health <<'HEALTH'
+OK
+HEALTH
+
+# Configure the S3 backup script using Terraform template variables.
+cat > /usr/local/bin/dr-backup.sh <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+
+export AWS_DEFAULT_REGION="${region}"
+
+aws s3 sync /var/www/html/data \
+  "s3://${bucket_name}/${backup_prefix}" \
+  --only-show-errors
+SCRIPT
+
+chmod 0750 /usr/local/bin/dr-backup.sh
+
+# Restore any existing backup. A missing or inaccessible backup is logged.
+if ! aws s3 sync \
+  "s3://${bucket_name}/${backup_prefix}" \
+  /var/www/html/data \
+  --only-show-errors; then
+  echo "WARNING: S3 restore failed. Check instance-role permissions and bucket access."
+fi
+
+# Ensure Nginx can read the website files.
+chown -R www-data:www-data /var/www/html
+
+# Back up application data every five minutes.
+cat > /etc/cron.d/dr-backup <<'CRON'
+*/5 * * * * root /usr/local/bin/dr-backup.sh >> /var/log/dr-backup.log 2>&1
+CRON
+
+chmod 0644 /etc/cron.d/dr-backup
+
+# Verify Nginx is running and reload its configuration.
+nginx -t
+systemctl enable --now nginx
+systemctl reload nginx
+
+# Test the local website before completing bootstrap.
+curl --fail --silent http://127.0.0.1/ >/dev/null
+curl --fail --silent http://127.0.0.1/health
+
+echo "EC2 Disaster Recovery bootstrap completed."
